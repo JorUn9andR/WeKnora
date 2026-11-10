@@ -1,0 +1,399 @@
+name: Release Lite Binaries (Intel Mac, Windows, Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-lite-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  # Build the frontend once. The resulting web/ files are embedded into each
+  # platform's Lite binary by the Go embed directives.
+  build-frontend:
+    name: Build Lite frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload frontend
+        uses: actions/upload-artifact@v7
+        with:
+          name: lite-frontend
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Build native CGO binaries for Linux amd64 and Intel macOS amd64.
+  build-unix-lite:
+    name: Build Lite (${{ matrix.goos }}-${{ matrix.goarch }})
+    needs: build-frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      CGO_ENABLED: "1"
+      RELEASE_TAG: ${{ inputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go from go.mod
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download frontend
+        uses: actions/download-artifact@v8
+        with:
+          name: lite-frontend
+          path: web/
+
+      - name: Install Linux CGO dependencies
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libsqlite3-dev
+
+      - name: Verify build target
+        shell: bash
+        run: |
+          echo "Runner: $(uname -a)"
+          echo "Go: $(go version)"
+          echo "Target: ${{ matrix.goos }}/${{ matrix.goarch }}"
+          test -f web/index.html
+
+      - name: Build Lite binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          export EDITION=lite
+          export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
+          eval "$(./scripts/get_version.sh env)"
+
+          LDFLAGS="-w -s $(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
+          export CGO_CFLAGS="-Wno-deprecated-declarations"
+
+          if [ "${{ matrix.goos }}" = "darwin" ]; then
+            export CGO_LDFLAGS="-Wl,-no_warn_duplicate_libraries"
+          fi
+
+          go build \
+            -tags "sqlite_fts5" \
+            -ldflags="${LDFLAGS}" \
+            -o WeKnora-lite \
+            ./cmd/server
+
+      - name: Package Linux/macOS Lite archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="WeKnora-lite_${RELEASE_TAG}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          DIST="dist/${ARCHIVE}"
+
+          rm -rf "$DIST"
+          mkdir -p "$DIST/web"
+
+          cp WeKnora-lite "$DIST/"
+          cp -r web/. "$DIST/web/"
+          cp .env.lite.example "$DIST/"
+          cp docs/LITE.md "$DIST/README.md"
+          bash ./scripts/copy-licenses.sh "$DIST"
+
+          if [ -d config ]; then
+            cp -r config "$DIST/config"
+          fi
+
+          if [ -d migrations/sqlite ]; then
+            mkdir -p "$DIST/migrations/sqlite"
+            cp -r migrations/sqlite/. "$DIST/migrations/sqlite/"
+          fi
+
+          if [ -f deploy/weknora-lite.service ]; then
+            cp deploy/weknora-lite.service "$DIST/"
+          fi
+
+          mkdir -p dist
+          tar -czf "${DIST}.tar.gz" -C dist "$ARCHIVE"
+          shasum -a 256 "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
+
+      - name: Upload Linux/macOS Lite artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lite-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # Windows requires a native UCRT MinGW toolchain for the bundled DuckDB
+  # static library, plus sqlite3.h for sqlite-vec. Do not use MSVCRT GCC or
+  # the duckdb_use_lib build tag on Windows.
+  build-windows-lite:
+    name: Build Lite (windows-amd64)
+    needs: build-frontend
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go from go.mod
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup MSYS2 SQLite headers
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-sqlite3
+
+      - name: Download frontend
+        uses: actions/download-artifact@v8
+        with:
+          name: lite-frontend
+          path: web/
+
+      - name: Install compatible GCC 14.2 UCRT toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'duckdb-gcc-14.2-ucrt.7z'
+          $gccRoot = 'C:\Tools\duckdb-gcc-14.2'
+          $gccBin = Join-Path $gccRoot 'mingw64\bin'
+          $url = 'https://github.com/niXman/mingw-builds-binaries/releases/download/14.2.0-rt_v12-rev0/x86_64-14.2.0-release-posix-seh-ucrt-rt_v12-rev0.7z'
+
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          New-Item -ItemType Directory -Force -Path $gccRoot | Out-Null
+
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+          }
+          if (-not (Test-Path $sevenZip)) {
+            throw '7-Zip was not found after installation.'
+          }
+
+          & $sevenZip x $archive "-o$gccRoot" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract GCC archive (exit code $LASTEXITCODE)."
+          }
+
+          $gcc = Join-Path $gccBin 'gcc.exe'
+          $gxx = Join-Path $gccBin 'g++.exe'
+          if (-not (Test-Path $gcc) -or -not (Test-Path $gxx)) {
+            throw "Expected gcc.exe/g++.exe under $gccBin; inspect the downloaded archive layout."
+          }
+
+          $gccVersion = (& $gcc -dumpfullversion -dumpversion | Out-String).Trim()
+          if ($gccVersion -notlike '14.2*') {
+            throw "Expected GCC 14.2, found $gccVersion."
+          }
+          $gccDetails = (& $gcc -v 2>&1 | Out-String)
+          if ($gccDetails -notmatch '(?i)ucrt') {
+            throw 'The selected GCC is not a UCRT toolchain.'
+          }
+
+          $sqliteInclude = 'C:\msys64\ucrt64\include'
+          if (-not (Test-Path (Join-Path $sqliteInclude 'sqlite3.h'))) {
+            throw "sqlite3.h not found under $sqliteInclude. MSYS2 UCRT64 SQLite package setup failed."
+          }
+
+          "WEKNORA_GCC_BIN=$gccBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WEKNORA_SQLITE_INCLUDE=$sqliteInclude" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $gccBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          Write-Host "Using GCC $gccVersion (UCRT)"
+          Write-Host "SQLite headers: $sqliteInclude"
+
+      - name: Verify Windows build target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((go env GOOS) -ne 'windows' -or (go env GOARCH) -ne 'amd64') {
+            throw 'This job must build windows/amd64.'
+          }
+          if (-not (Test-Path 'web\index.html')) {
+            throw 'Frontend artifact web/index.html is missing.'
+          }
+          go version
+          & "$env:WEKNORA_GCC_BIN\gcc.exe" --version
+
+      - name: Build Windows Lite binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $gcc = Join-Path $env:WEKNORA_GCC_BIN 'gcc.exe'
+          $gxx = Join-Path $env:WEKNORA_GCC_BIN 'g++.exe'
+
+          $env:CC = $gcc
+          $env:CXX = $gxx
+          $env:CGO_ENABLED = '1'
+          $env:CGO_CFLAGS = "-Wno-deprecated-declarations -idirafter $($env:WEKNORA_SQLITE_INCLUDE.Replace('\','/'))"
+          $env:EDITION = 'lite'
+          $env:GOLANG_PROTOBUF_REGISTRATION_CONFLICT = 'warn'
+
+          $version = 'unknown'
+          if (Test-Path 'VERSION') {
+            $version = (Get-Content 'VERSION' -Raw).Trim()
+          }
+          $commitId = $env:GITHUB_SHA.Substring(0, 7)
+          $buildTime = [DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+          $goVersion = (go version | Out-String).Trim()
+
+          $ldflags = "-w -s -X 'github.com/Tencent/WeKnora/internal/handler.Version=$version' -X 'github.com/Tencent/WeKnora/internal/handler.Edition=lite' -X 'github.com/Tencent/WeKnora/internal/handler.CommitID=$commitId' -X 'github.com/Tencent/WeKnora/internal/handler.BuildTime=$buildTime' -X 'github.com/Tencent/WeKnora/internal/handler.GoVersion=$goVersion' -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
+
+          Write-Host "CC=$env:CC"
+          Write-Host "CXX=$env:CXX"
+          Write-Host "CGO_CFLAGS=$env:CGO_CFLAGS"
+          Write-Host "Building WeKnora-lite.exe"
+
+          & go build -tags sqlite_fts5 -ldflags $ldflags -o WeKnora-lite.exe ./cmd/server
+          if ($LASTEXITCODE -ne 0) {
+            throw "Go build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Package Windows Lite archive
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archiveName = "WeKnora-lite_${env:RELEASE_TAG}_windows_amd64"
+          $distRoot = Join-Path $PWD 'dist'
+          $distDir = Join-Path $distRoot $archiveName
+          $webDir = Join-Path $distDir 'web'
+          New-Item -ItemType Directory -Force -Path $webDir | Out-Null
+
+          Copy-Item 'WeKnora-lite.exe' $distDir
+          Copy-Item '.env.lite.example' $distDir
+          Copy-Item 'docs\LITE.md' (Join-Path $distDir 'README.md')
+          Copy-Item 'web\*' $webDir -Recurse -Force
+
+          if (Test-Path 'config') {
+            Copy-Item 'config' (Join-Path $distDir 'config') -Recurse -Force
+          }
+          if (Test-Path 'migrations\sqlite') {
+            $migrationDir = Join-Path $distDir 'migrations\sqlite'
+            New-Item -ItemType Directory -Force -Path $migrationDir | Out-Null
+            Copy-Item 'migrations\sqlite\*' $migrationDir -Recurse -Force
+          }
+
+          bash ./scripts/copy-licenses.sh $distDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Copying license files failed with exit code $LASTEXITCODE."
+          }
+
+          $zipPath = Join-Path $distRoot "$archiveName.zip"
+          Compress-Archive -Path $distDir -DestinationPath $zipPath -Force
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archiveName.zip" | Out-File -FilePath "$zipPath.sha256" -Encoding ascii
+
+      - name: Upload Windows Lite artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lite-windows-amd64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publish exactly the three Lite targets built above. No Wails Desktop,
+  # Apple Silicon, Universal, or Linux ARM64 jobs are created by this workflow.
+  release:
+    name: Publish Lite release
+    needs:
+      - build-unix-lite
+      - build-windows-lite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: lite-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: |
+          set -euo pipefail
+          find release-assets -maxdepth 1 -type f -print
+          test -n "$(find release-assets -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)"
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          cat > notes.md <<EOF
+          ## WeKnora Lite ${RELEASE_TAG}
+
+          Lite single-binary packages (SQLite + in-memory queue; no Wails Desktop app).
+
+          | File | Platform |
+          |---|---|
+          | WeKnora-lite_*_darwin_amd64.tar.gz | macOS Intel (x86_64) |
+          | WeKnora-lite_*_windows_amd64.zip | Windows x86_64 |
+          | WeKnora-lite_*_linux_amd64.tar.gz | Linux x86_64 |
+
+          Each archive includes the Lite binary, frontend assets, .env.lite.example, configuration/migrations when present, and license notices.
+          Copy .env.lite.example to .env.lite, edit the model endpoint/settings, then run the platform binary.
+          EOF
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+            gh release edit "$RELEASE_TAG" --title "WeKnora Lite $RELEASE_TAG" --notes-file notes.md
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "WeKnora Lite $RELEASE_TAG" \
+              --notes-file notes.md
+          fi
