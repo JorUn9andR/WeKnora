@@ -56,9 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Build on Ubuntu 22.04 to keep the glibc baseline lower and improve
-          # compatibility with older x86_64 Linux distributions.
-          - runner: ubuntu-22.04
+          - runner: ubuntu-latest
             goos: linux
             goarch: amd64
           - runner: macos-15-intel
@@ -462,84 +460,7 @@ jobs:
               throw "Jieba dictionary was not packaged: $targetFile"
             }
           }
-          foreach ($file in $jiebaFiles) {
-            $targetFile = Join-Path $jiebaTarget $file
-            if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) {
-              throw "Jieba dictionary was not packaged: $targetFile"
-            }
-            if ((Get-Item -LiteralPath $targetFile).Length -le 0) {
-              throw "Jieba dictionary is empty: $targetFile"
-            }
-          }
           Write-Host "Bundled Jieba dictionaries into $jiebaTarget"
-
-      # gojieba is C++ based. A Windows executable may import MinGW runtime
-      # DLLs, so resolve its PE imports and bundle non-Windows system DLLs.
-      # This avoids requiring users to install the build toolchain.
-      - name: Bundle Windows C++ runtime dependencies
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $objdump = Join-Path $env:WEKNORA_GCC_BIN 'objdump.exe'
-          if (-not (Test-Path -LiteralPath $objdump -PathType Leaf)) {
-            throw "MinGW objdump.exe was not found: $objdump"
-          }
-
-          $distDir = Join-Path $PWD "dist/WeKnora-lite_${env:RELEASE_TAG}_windows_amd64"
-          $exe = (Resolve-Path 'WeKnora-lite.exe').Path
-          $runtimeDirs = @(
-            $env:WEKNORA_GCC_BIN,
-            (Join-Path (Split-Path $env:WEKNORA_SQLITE_INCLUDE -Parent) 'bin')
-          ) | Select-Object -Unique
-
-          $pending = [System.Collections.Generic.Queue[string]]::new()
-          $pending.Enqueue($exe)
-          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-          $copied = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-          while ($pending.Count -gt 0) {
-            $current = $pending.Dequeue()
-            if (-not $seen.Add($current)) { continue }
-
-            $inspection = & $objdump -p $current 2>&1
-            if ($LASTEXITCODE -ne 0) {
-              throw "objdump failed while inspecting $current"
-            }
-
-            foreach ($line in $inspection) {
-              if ($line -notmatch 'DLL Name:\s*(.+)$') { continue }
-              $dll = $Matches[1].Trim()
-              if ([string]::IsNullOrWhiteSpace($dll)) { continue }
-              if ($dll -match '^(?i:api-ms-win-|ext-ms-win-)') { continue }
-              if (Test-Path -LiteralPath (Join-Path $env:WINDIR "System32/$dll")) { continue }
-
-              $alreadyBundled = Join-Path $distDir $dll
-              if (Test-Path -LiteralPath $alreadyBundled) {
-                $pending.Enqueue($alreadyBundled)
-                continue
-              }
-
-              $sourceDll = $null
-              foreach ($runtimeDir in $runtimeDirs) {
-                $candidate = Join-Path $runtimeDir $dll
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                  $sourceDll = $candidate
-                  break
-                }
-              }
-
-              if (-not $sourceDll) {
-                throw "Unresolved non-system DLL dependency '$dll' imported by '$current'."
-              }
-
-              Copy-Item -LiteralPath $sourceDll -Destination $alreadyBundled -Force
-              [void]$copied.Add($dll)
-              $pending.Enqueue($alreadyBundled)
-              Write-Host "Bundled runtime DLL: $dll"
-            }
-          }
-
-          Write-Host "Bundled $($copied.Count) non-system runtime DLL(s)."
 
       - name: Copy Windows license notices and source archives
         shell: bash
@@ -576,6 +497,14 @@ jobs:
       - build-windows-lite
     runs-on: ubuntu-latest
     steps:
+      # gh release commands need an explicit repository context. Keep a checkout
+      # as a fallback for GitHub CLI and other tooling that inspects git metadata.
+      - name: Checkout repository for release publishing
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
       - name: Download platform artifacts
         uses: actions/download-artifact@v8
         with:
@@ -614,16 +543,23 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          echo "Publishing repository: $GH_REPO"
+          echo "Release tag: $RELEASE_TAG"
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GH_REPO"
             gh release edit "$RELEASE_TAG" \
               --title "WeKnora Lite $RELEASE_TAG" \
-              --notes-file notes.md
+              --notes-file notes.md \
+              --repo "$GH_REPO"
           else
             gh release create "$RELEASE_TAG" release-assets/* \
               --title "WeKnora Lite $RELEASE_TAG" \
-              --notes-file notes.md
+              --notes-file notes.md \
+              --target "$TARGET_SHA" \
+              --repo "$GH_REPO"
           fi
