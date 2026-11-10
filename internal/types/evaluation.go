@@ -2,32 +2,93 @@ package types
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/yanyiwu/gojieba"
 )
 
-// Jieba is a global instance of Chinese text segmentation tool
+var jiebaDictionaryFiles = []string{
+	"jieba.dict.utf8",
+	"hmm_model.utf8",
+	"user.dict.utf8",
+	"idf.utf8",
+	"stop_words.utf8",
+}
+
+// Jieba is a global instance of Chinese text segmentation tool.
+// Dictionary files are resolved in this order:
+//  1. JIEBA_DICT_DIR (explicit override)
+//  2. resources/jieba next to the executable (Lite release layout)
+//  3. resources/jieba under the current working directory (development)
+//  4. gojieba's bundled module dictionary directory (development fallback)
 var Jieba *gojieba.Jieba = newJieba()
 
 func newJieba() *gojieba.Jieba {
-	dictDir := os.Getenv("JIEBA_DICT_DIR")
-	if dictDir == "" {
-		return gojieba.NewJieba()
+	candidates := make([]string, 0, 4)
+
+	if configuredDir := strings.TrimSpace(os.Getenv("JIEBA_DICT_DIR")); configuredDir != "" {
+		candidates = append(candidates, configuredDir)
 	}
 
-	return gojieba.NewJieba(
-		filepath.Join(dictDir, "jieba.dict.utf8"),
-		filepath.Join(dictDir, "hmm_model.utf8"),
-		filepath.Join(dictDir, "user.dict.utf8"),
-		filepath.Join(dictDir, "idf.utf8"),
-		filepath.Join(dictDir, "stop_words.utf8"),
-	)
+	if executable, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(executable), "resources", "jieba"))
+	}
+
+	if workingDir, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(workingDir, "resources", "jieba"))
+	}
+
+	// gojieba derives this path from its source/module location. It is useful
+	// during local development, but must not be the only path in a release.
+	if moduleDictDir := strings.TrimSpace(gojieba.DICT_DIR); moduleDictDir != "" {
+		candidates = append(candidates, moduleDictDir)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	searched := make([]string, 0, len(candidates))
+	for _, dir := range candidates {
+		dir = filepath.Clean(dir)
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		searched = append(searched, dir)
+
+		if !hasJiebaDictionary(dir) {
+			continue
+		}
+
+		paths := make([]string, 0, len(jiebaDictionaryFiles))
+		for _, name := range jiebaDictionaryFiles {
+			paths = append(paths, filepath.Join(dir, name))
+		}
+		return gojieba.NewJieba(paths...)
+	}
+
+	panic(fmt.Sprintf(
+		"Jieba dictionary files not found. Put the five dictionary files in resources/jieba next to the executable, or set JIEBA_DICT_DIR. Searched: %s",
+		strings.Join(searched, "; "),
+	))
 }
 
-// EvaluationStatue represents the status of an evaluation task
+func hasJiebaDictionary(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	for _, name := range jiebaDictionaryFiles {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
+
+// EvaluationStatue represents the status of an evaluation task.
 type EvaluationStatue int
 
 const (
@@ -37,80 +98,77 @@ const (
 	EvaluationStatueFailed                          // Task failed
 )
 
-// EvaluationTask contains information about an evaluation task
+// EvaluationTask contains information about an evaluation task.
 type EvaluationTask struct {
-	ID        string `json:"id"`         // Unique task ID
-	TenantID  uint64 `json:"tenant_id"`  // Tenant/Organization ID
-	DatasetID string `json:"dataset_id"` // Dataset ID for evaluation
-
+	ID        string           `json:"id"`                // Unique task ID
+	TenantID  uint64           `json:"tenant_id"`         // Tenant/Organization ID
+	DatasetID string           `json:"dataset_id"`        // Dataset ID for evaluation
 	StartTime time.Time        `json:"start_time"`        // Task start time
 	Status    EvaluationStatue `json:"status"`            // Current task status
 	ErrMsg    string           `json:"err_msg,omitempty"` // Error message if failed
 
 	Total    int `json:"total,omitempty"`    // Total items to evaluate
-	Finished int `json:"finished,omitempty"` // Completed items count
+	Finished int `json:"finished,omitempty"` // Finished items count
 }
 
-// EvaluationDetail contains detailed evaluation information
+// EvaluationDetail contains detailed information about an evaluation task.
 type EvaluationDetail struct {
-	Task   *EvaluationTask `json:"task"`             // Evaluation task info
-	Params *ChatManage     `json:"params"`           // Evaluation parameters
-	Metric *MetricResult   `json:"metric,omitempty"` // Evaluation metrics
+	Task   *EvaluationTask `json:"task"`
+	Params *ChatManage     `json:"params"`
+	Metric *MetricResult   `json:"metric,omitempty"`
 }
 
-// String returns JSON representation of EvaluationTask
+// String returns the JSON representation of EvaluationTask.
 func (e *EvaluationTask) String() string {
 	b, _ := json.Marshal(e)
 	return string(b)
 }
 
-// MetricInput contains input data for metric calculation
+// MetricInput contains input data for metric calculation.
 type MetricInput struct {
-	RetrievalGT  [][]int // Ground truth for retrieval
-	RetrievalIDs []int   // Retrieved IDs
+	RetrievalGT  [][]int
+	RetrievalIDs []int
 
-	GeneratedTexts string // Generated text for evaluation
-	GeneratedGT    string // Ground truth text for comparison
+	GeneratedTexts string
+	GeneratedGT    string
 }
 
-// MetricResult contains evaluation metrics
+// MetricResult contains detailed metric results.
 type MetricResult struct {
-	RetrievalMetrics  RetrievalMetrics  `json:"retrieval_metrics"`  // Retrieval performance metrics
-	GenerationMetrics GenerationMetrics `json:"generation_metrics"` // Text generation quality metrics
+	RetrievalMetrics  RetrievalMetrics  `json:"retrieval_metrics"`
+	GenerationMetrics GenerationMetrics `json:"generation_metrics"`
 }
 
-// RetrievalMetrics contains metrics for retrieval evaluation
+// RetrievalMetrics contains retrieval quality metrics.
 type RetrievalMetrics struct {
-	Precision float64 `json:"precision"` // Precision score
-	Recall    float64 `json:"recall"`    // Recall score
-
-	NDCG3  float64 `json:"ndcg3"`  // Normalized Discounted Cumulative Gain at 3
-	NDCG10 float64 `json:"ndcg10"` // Normalized Discounted Cumulative Gain at 10
-	MRR    float64 `json:"mrr"`    // Mean Reciprocal Rank
-	MAP    float64 `json:"map"`    // Mean Average Precision
+	Precision float64 `json:"precision"`
+	Recall    float64 `json:"recall"`
+	NDCG3     float64 `json:"ndcg3"`
+	NDCG10    float64 `json:"ndcg10"`
+	MRR       float64 `json:"mrr"`
+	MAP       float64 `json:"map"`
 }
 
-// GenerationMetrics contains metrics for text generation evaluation
+// GenerationMetrics contains generation quality metrics.
 type GenerationMetrics struct {
-	BLEU1 float64 `json:"bleu1"` // BLEU-1 score
-	BLEU2 float64 `json:"bleu2"` // BLEU-2 score
-	BLEU4 float64 `json:"bleu4"` // BLEU-4 score
-
-	ROUGE1 float64 `json:"rouge1"` // ROUGE-1 score
-	ROUGE2 float64 `json:"rouge2"` // ROUGE-2 score
-	ROUGEL float64 `json:"rougel"` // ROUGE-L score
+	BLEU1  float64 `json:"bleu1"`
+	BLEU2  float64 `json:"bleu2"`
+	BLEU4  float64 `json:"bleu4"`
+	ROUGE1 float64 `json:"rouge1"`
+	ROUGE2 float64 `json:"rouge2"`
+	ROUGEL float64 `json:"rougel"`
 }
 
-// EvalState represents different stages of evaluation process
+// EvalState represents different stages of an evaluation process.
 type EvalState int
 
 const (
-	StateBegin             EvalState = iota // Evaluation started
-	StateAfterQaPairs                       // After loading QA pairs
-	StateAfterDataset                       // After processing dataset
-	StateAfterEmbedding                     // After generating embeddings
-	StateAfterVectorSearch                  // After vector search
-	StateAfterRerank                        // After reranking
-	StateAfterComplete                      // After completion
-	StateEnd                                // Evaluation ended
+	StateBegin EvalState = iota
+	StateAfterQaPairs
+	StateAfterDataset
+	StateAfterEmbedding
+	StateAfterVectorSearch
+	StateAfterRerank
+	StateAfterComplete
+	StateEnd
 )
