@@ -188,10 +188,26 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          # 显式移除默认可能冲突的包，强制同步核心包
-          install: >-
-            mingw-w64-ucrt-x86_64-sqlite3
-            mingw-w64-ucrt-x86_64-gcc
+          install: mingw-w64-ucrt-x86_64-sqlite3
+
+      # 💡 新增：针对 GitHub Actions Windows 环境的保底强制修复步骤
+      - name: Force Fix MSYS2 SQLite Installation
+        shell: pwsh
+        run: |
+          $sqliteHeader = "C:\msys64\ucrt64\include\sqlite3.h"
+          if (-not (Test-Path $sqliteHeader)) {
+            Write-Warning "MSYS2 setup-msys2 extension failed to drop sqlite3.h. Attempting forced manual mirror sync..."
+            # 强行刷新 pacman 数据库并重试安装
+            & C:\msys64\usr\bin\bash.exe -lc "pacman -Syy --noconfirm"
+            & C:\msys64\usr\bin\bash.exe -lc "pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-sqlite3"
+            
+            if (-not (Test-Path $sqliteHeader)) {
+              throw "Fatal: Forced pacman recovery installation also failed to install sqlite3.h."
+            }
+            Write-Host "Successfully recovered and installed sqlite3.h manually!"
+          } else {
+            Write-Host "Verified: sqlite3.h is present."
+          }
 
       - name: Download frontend
         uses: actions/download-artifact@v8
