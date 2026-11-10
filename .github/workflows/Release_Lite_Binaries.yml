@@ -188,7 +188,10 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: mingw-w64-ucrt-x86_64-sqlite3
+          # 显式移除默认可能冲突的包，强制同步核心包
+          install: >-
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-gcc
 
       - name: Download frontend
         uses: actions/download-artifact@v8
